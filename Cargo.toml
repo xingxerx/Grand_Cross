@@ -1,0 +1,28 @@
+[package]
+name = "grand_cross"
+version = "0.1.0"
+edition = "2021"
+description = "Grand_Cross crossplay relay"
+
+[lib]
+path = "lib.rs"
+
+[[bin]]
+name = "grand_cross"
+path = "main.rs"
+
+[dependencies]
+tokio = { version = "1", features = ["full"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+anyhow = "1"
+async-trait = "0.1"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+uuid = { version = "1", features = ["v4"] }
+chrono = { version = "0.4", features = ["serde"] }
+bytes = "1"
+dashmap = "5"
+tokio-tungstenite = { version = "0.21", features = ["native-tls"] }
+clap = { version = "4", features = ["derive", "env"] }
+futures-util = "0.3"
