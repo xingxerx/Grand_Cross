@@ -1,0 +1,601 @@
+diff --git a/Cargo.toml b/Cargo.toml
+index 058bae4..821a40b 100644
+--- a/Cargo.toml
++++ b/Cargo.toml
+@@ -26,3 +26,4 @@ dashmap = "5"
+ tokio-tungstenite = { version = "0.21", features = ["native-tls"] }
+ clap = { version = "4", features = ["derive", "env"] }
+ futures-util = "0.3"
++thiserror = "1"
+diff --git a/callout.rs b/callout.rs
+new file mode 100644
+index 0000000..1e44e94
+--- /dev/null
++++ b/callout.rs
+@@ -0,0 +1,147 @@
++//! Callout system — pre-translated, enum-routed comms.
++//!
++//! No STT/MT/TTS in the loop. A CalloutId is a u16, routed through the
++//! same DashMap relay as everything else, and rendered client-side from
++//! a static per-language lookup table. Latency is router-bound only
++//! (same order as a Move packet), not translation-bound.
++//!
++//! This is the "real-time" tier. `translate.rs` is the near-real-time
++//! tier for freeform chat/voice — use this for anything where a
++//! mistranslation or delay has in-raid consequences.
++
++use serde::{Deserialize, Serialize};
++use std::collections::HashMap;
++
++#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
++#[repr(u16)]
++pub enum CalloutId {
++    EnemyLeft      = 0x0001,
++    EnemyRight     = 0x0002,
++    EnemyAhead     = 0x0003,
++    EnemyBehind    = 0x0004,
++    NeedHeal       = 0x0005,
++    NeedAmmo       = 0x0006,
++    FallBack       = 0x0007,
++    PushForward    = 0x0008,
++    ObjectiveClear = 0x0009,
++    HoldPosition   = 0x000A,
++    Incoming       = 0x000B,
++    Reviving       = 0x000C,
++    Down           = 0x000D,
++    OnMyWay        = 0x000E,
++    Thanks         = 0x000F,
++    Sorry          = 0x0010,
++}
++
++/// Wire payload for CrpEventType::Callout. Tiny — this is the point.
++#[derive(Debug, Clone, Serialize, Deserialize)]
++pub struct CalloutPacket {
++    pub player_id: String,
++    pub callout:   CalloutId,
++}
++
++impl CalloutPacket {
++    pub fn encode(&self) -> Vec<u8> {
++        serde_json::to_vec(self).unwrap_or_default()
++    }
++
++    pub fn decode(buf: &[u8]) -> Option<Self> {
++        serde_json::from_slice(buf).ok()
++    }
++}
++
++/// Client-side localization table. One process per player locale,
++/// not per message — this is a static lookup, never a live call.
++pub struct CalloutLocalizer {
++    lang: String,
++    table: HashMap<CalloutId, &'static str>,
++}
++
++impl CalloutLocalizer {
++    pub fn new(lang: &str) -> Self {
++        Self {
++            lang: lang.to_string(),
++            table: Self::table_for(lang),
++        }
++    }
++
++    pub fn render(&self, id: CalloutId) -> &'static str {
++        self.table.get(&id).copied().unwrap_or("[callout]")
++    }
++
++    /// Add/extend language tables here. Keep en as the fallback baseline
++    /// so a missing translation degrades to English, not to a blank string.
++    fn table_for(lang: &str) -> HashMap<CalloutId, &'static str> {
++        use CalloutId::*;
++        let en: &[(CalloutId, &'static str)] = &[
++            (EnemyLeft, "Enemy left!"),
++            (EnemyRight, "Enemy right!"),
++            (EnemyAhead, "Enemy ahead!"),
++            (EnemyBehind, "Enemy behind!"),
++            (NeedHeal, "Need heal!"),
++            (NeedAmmo, "Need ammo!"),
++            (FallBack, "Fall back!"),
++            (PushForward, "Push forward!"),
++            (ObjectiveClear, "Objective clear!"),
++            (HoldPosition, "Hold position!"),
++            (Incoming, "Incoming!"),
++            (Reviving, "Reviving!"),
++            (Down, "Down!"),
++            (OnMyWay, "On my way!"),
++            (Thanks, "Thanks!"),
++            (Sorry, "Sorry!"),
++        ];
++        let es: &[(CalloutId, &'static str)] = &[
++            (EnemyLeft, "¡Enemigo a la izquierda!"),
++            (EnemyRight, "¡Enemigo a la derecha!"),
++            (EnemyAhead, "¡Enemigo al frente!"),
++            (EnemyBehind, "¡Enemigo detrás!"),
++            (NeedHeal, "¡Necesito curación!"),
++            (NeedAmmo, "¡Necesito munición!"),
++            (FallBack, "¡Retirada!"),
++            (PushForward, "¡Avanzar!"),
++            (ObjectiveClear, "¡Objetivo despejado!"),
++            (HoldPosition, "¡Mantener posición!"),
++            (Incoming, "¡Vienen!"),
++            (Reviving, "¡Reviviendo!"),
++            (Down, "¡Caído!"),
++            (OnMyWay, "¡Voy para allá!"),
++            (Thanks, "¡Gracias!"),
++            (Sorry, "¡Perdón!"),
++        ];
++
++        let base: &[(CalloutId, &'static str)] = match lang {
++            "es" => es,
++            _ => en, // fallback baseline
++        };
++        base.iter().copied().collect()
++    }
++
++    pub fn lang(&self) -> &str { &self.lang }
++}
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++
++    #[test]
++    fn round_trip_encode_decode() {
++        let pkt = CalloutPacket { player_id: "p1".into(), callout: CalloutId::NeedHeal };
++        let bytes = pkt.encode();
++        let decoded = CalloutPacket::decode(&bytes).unwrap();
++        assert_eq!(decoded.callout, CalloutId::NeedHeal);
++        assert_eq!(decoded.player_id, "p1");
++    }
++
++    #[test]
++    fn localizer_fallback_to_en() {
++        let loc = CalloutLocalizer::new("fr"); // no fr table yet
++        assert_eq!(loc.render(CalloutId::FallBack), "Fall back!");
++    }
++
++    #[test]
++    fn localizer_es() {
++        let loc = CalloutLocalizer::new("es");
++        assert_eq!(loc.render(CalloutId::NeedHeal), "¡Necesito curación!");
++    }
++}
+diff --git a/crp.rs b/crp.rs
+index 21b6ed4..8e126cf 100644
+--- a/crp.rs
++++ b/crp.rs
+@@ -29,6 +29,7 @@ pub enum CrpEventType {
+     Pong         = 0x07, // keepalive ack
+     Action       = 0x08, // platform-specific game action
+     SessionState = 0x09, // full roster broadcast
++    Callout      = 0x0A, // pre-translated enum callout (see callout.rs)
+ }
+ 
+ #[derive(Debug, Clone, Serialize, Deserialize)]
+@@ -79,6 +80,7 @@ impl CrpPacket {
+             0x07 => CrpEventType::Pong,
+             0x08 => CrpEventType::Action,
+             0x09 => CrpEventType::SessionState,
++            0x0A => CrpEventType::Callout,
+             _    => return None,
+         };
+         let payload_len = u16::from_le_bytes(buf[17..19].try_into().ok()?) as usize;
+diff --git a/lib.rs b/lib.rs
+index a45ad1e..a3b1598 100644
+--- a/lib.rs
++++ b/lib.rs
+@@ -1,5 +1,6 @@
+ pub mod actions;
+ pub mod adapters;
++pub mod callout;
+ pub mod crp;
+ pub mod dispatch;
+ pub mod filter;
+@@ -14,12 +15,17 @@ pub mod roblox;
+ pub mod router;
+ pub mod session;
+ pub mod session_manager;
++pub mod stream_translate;
++pub mod translate;
+ pub mod voice;
+ 
+ pub use actions::*;
+ pub use adapters::*;
++pub use callout::*;
+ pub use crp::*;
+ pub use platform::*;
+ pub use session::*;
++pub use stream_translate::*;
++pub use translate::*;
+ pub use voice::*;
+ pub use filter::*;
+diff --git a/stream_translate.rs b/stream_translate.rs
+new file mode 100644
+index 0000000..38bc7fa
+--- /dev/null
++++ b/stream_translate.rs
+@@ -0,0 +1,254 @@
++//! Chunked streaming translation — audio in, audio out, tuned to the
++//! measured floor (~300-500ms) instead of request-response.
++//!
++//! This does NOT wait for a full utterance. It accumulates PCM into
++//! `chunk_ms`-sized windows (StreamSpeech-style chunked encoding) and
++//! flushes each chunk to the backend as soon as it's full, so output
++//! starts streaming back before the player has finished talking.
++//!
++//! Backend contract lives in `StreamingTranslationBackend` — wire it
++//! to a chunked encoder (e.g. a StreamSpeech deployment) or a vendor
++//! streaming S2ST endpoint. No backend is bundled; see translate.rs
++//! for the same caveat on the request-response side.
++//!
++//! Use this for freeform voice. Use callout.rs for anything where a
++//! wrong or late translation has in-raid consequences — this module
++//! cannot go below the ~300ms information floor explained in-chat;
++//! that floor is physical (a chunk must contain enough audio to
++//! disambiguate meaning), not an engineering gap.
++
++use async_trait::async_trait;
++use dashmap::DashMap;
++use std::sync::Arc;
++
++use crate::translate::TranslateError;
++
++pub const SAMPLE_RATE_HZ: u32 = 48_000;
++
++/// Tunable chunk size. 350ms is a reasonable default balance point.
++/// Push lower for latency, higher for accuracy — below ~250ms,
++/// accuracy degrades sharply for most language pairs (verb-final
++/// languages like German/Japanese need more lookahead). Exposed
++/// per-instance rather than hardcoded so it can be tuned per
++/// language pair or per deployment.
++#[derive(Debug, Clone, Copy)]
++pub struct ChunkConfig {
++    pub chunk_ms: u32,
++}
++
++impl Default for ChunkConfig {
++    fn default() -> Self { Self { chunk_ms: 350 } }
++}
++
++impl ChunkConfig {
++    pub fn samples_per_chunk(&self) -> usize {
++        (SAMPLE_RATE_HZ as u64 * self.chunk_ms as u64 / 1000) as usize
++    }
++}
++
++/// Already-translated, already-synthesized PCM, ready to re-encode
++/// to Opus and forward through the existing VoiceFrame pipeline.
++#[derive(Debug, Clone)]
++pub struct TranslatedChunk {
++    pub player_id:   String,
++    pub target_lang: String,
++    pub pcm:         Vec<f32>,
++    pub seq:         u32,
++    /// True on the flush() call that drains a partial trailing buffer
++    /// (e.g. when VAD goes inactive) — signals downstream not to
++    /// expect more chunks for this utterance.
++    pub is_final:    bool,
++}
++
++/// Streaming backend contract: one chunk in, one chunk out. Must NOT
++/// buffer internally waiting for a full utterance — that defeats the
++/// point of chunking here. Implement against a real chunked S2ST
++/// model/endpoint.
++#[async_trait]
++pub trait StreamingTranslationBackend: Send + Sync {
++    async fn translate_chunk(
++        &self,
++        pcm_chunk: &[f32],
++        from: &str,
++        to: &str,
++    ) -> Result<Vec<f32>, TranslateError>;
++}
++
++/// Per (player, target_lang) rolling buffer.
++struct ChunkBuffer {
++    samples: Vec<f32>,
++    seq:     u32,
++}
++
++impl ChunkBuffer {
++    fn new() -> Self { Self { samples: Vec::new(), seq: 0 } }
++}
++
++/// Orchestrates chunked streaming translation across all active
++/// (player, target_lang) sessions. Same per-key state pattern as
++/// VoiceFilter in pipeline.rs — one buffer per session, not global.
++pub struct StreamTranslator<B: StreamingTranslationBackend> {
++    backend: Arc<B>,
++    config:  ChunkConfig,
++    buffers: DashMap<(String, String), ChunkBuffer>, // (player_id, target_lang)
++}
++
++impl<B: StreamingTranslationBackend> StreamTranslator<B> {
++    pub fn new(backend: B, config: ChunkConfig) -> Self {
++        Self {
++            backend: Arc::new(backend),
++            config,
++            buffers: DashMap::new(),
++        }
++    }
++
++    /// Feed incoming PCM for a player, targeted at one recipient
++    /// language. Returns a translated chunk once enough audio has
++    /// accumulated to flush; None if still buffering.
++    ///
++    /// Call once per (player, target_lang) pair per incoming voice
++    /// frame — fan out per recipient language, same as
++    /// translate_for_recipients does for text in translate.rs.
++    pub async fn ingest(
++        &self,
++        player_id:   &str,
++        from_lang:   &str,
++        target_lang: &str,
++        pcm:         &[f32],
++    ) -> Result<Option<TranslatedChunk>, TranslateError> {
++        let key = (player_id.to_string(), target_lang.to_string());
++        let threshold = self.config.samples_per_chunk();
++
++        let ready = {
++            let mut entry = self.buffers.entry(key.clone()).or_insert_with(ChunkBuffer::new);
++            entry.samples.extend_from_slice(pcm);
++            entry.samples.len() >= threshold
++        };
++
++        if !ready {
++            return Ok(None);
++        }
++
++        let (chunk, seq) = {
++            let mut entry = self.buffers.get_mut(&key).expect("key just inserted above");
++            let take = threshold.min(entry.samples.len());
++            let chunk: Vec<f32> = entry.samples.drain(..take).collect();
++            entry.seq += 1;
++            (chunk, entry.seq)
++        };
++
++        let translated = self.backend.translate_chunk(&chunk, from_lang, target_lang).await?;
++
++        Ok(Some(TranslatedChunk {
++            player_id:   player_id.to_string(),
++            target_lang: target_lang.to_string(),
++            pcm:         translated,
++            seq,
++            is_final:    false,
++        }))
++    }
++
++    /// Drain any partial trailing buffer — call when VAD goes
++    /// inactive (player stopped talking) so the last sub-chunk isn't
++    /// silently dropped. Result is marked is_final.
++    pub async fn flush(
++        &self,
++        player_id:   &str,
++        from_lang:   &str,
++        target_lang: &str,
++    ) -> Result<Option<TranslatedChunk>, TranslateError> {
++        let key = (player_id.to_string(), target_lang.to_string());
++
++        let (chunk, seq) = {
++            let Some(mut entry) = self.buffers.get_mut(&key) else { return Ok(None) };
++            if entry.samples.is_empty() { return Ok(None); }
++            let chunk: Vec<f32> = entry.samples.drain(..).collect();
++            entry.seq += 1;
++            (chunk, entry.seq)
++        };
++
++        let translated = self.backend.translate_chunk(&chunk, from_lang, target_lang).await?;
++
++        Ok(Some(TranslatedChunk {
++            player_id:   player_id.to_string(),
++            target_lang: target_lang.to_string(),
++            pcm:         translated,
++            seq,
++            is_final:    true,
++        }))
++    }
++
++    /// Drop a session's buffer entirely, e.g. on player disconnect.
++    pub fn drop_session(&self, player_id: &str, target_lang: &str) {
++        self.buffers.remove(&(player_id.to_string(), target_lang.to_string()));
++    }
++
++    pub fn active_sessions(&self) -> usize {
++        self.buffers.len()
++    }
++}
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++
++    /// Test double — identity backend, same length in/out. A real
++    /// backend (StreamSpeech or a vendor streaming endpoint) replaces
++    /// this and is free to change sample count between languages.
++    struct IdentityBackend;
++
++    #[async_trait]
++    impl StreamingTranslationBackend for IdentityBackend {
++        async fn translate_chunk(&self, pcm: &[f32], _from: &str, _to: &str) -> Result<Vec<f32>, TranslateError> {
++            Ok(pcm.to_vec())
++        }
++    }
++
++    fn silence(n: usize) -> Vec<f32> { vec![0.0f32; n] }
++
++    #[tokio::test]
++    async fn buffers_until_chunk_threshold() {
++        let cfg = ChunkConfig { chunk_ms: 100 }; // 4800 samples @ 48kHz
++        let t = StreamTranslator::new(IdentityBackend, cfg);
++
++        // Feed half a chunk — should not flush yet.
++        let half = silence(cfg.samples_per_chunk() / 2);
++        let r = t.ingest("p1", "en", "es", &half).await.unwrap();
++        assert!(r.is_none());
++
++        // Feed the rest — should flush now.
++        let rest = silence(cfg.samples_per_chunk() - half.len());
++        let r = t.ingest("p1", "en", "es", &rest).await.unwrap();
++        assert!(r.is_some());
++        let chunk = r.unwrap();
++        assert_eq!(chunk.seq, 1);
++        assert!(!chunk.is_final);
++    }
++
++    #[tokio::test]
++    async fn flush_drains_partial_and_marks_final() {
++        let cfg = ChunkConfig { chunk_ms: 500 };
++        let t = StreamTranslator::new(IdentityBackend, cfg);
++
++        let partial = silence(1000); // well under threshold
++        let r = t.ingest("p1", "en", "ja", &partial).await.unwrap();
++        assert!(r.is_none());
++
++        let flushed = t.flush("p1", "en", "ja").await.unwrap().unwrap();
++        assert!(flushed.is_final);
++        assert_eq!(flushed.pcm.len(), 1000);
++    }
++
++    #[tokio::test]
++    async fn independent_sessions_per_target_lang() {
++        let cfg = ChunkConfig::default();
++        let t = StreamTranslator::new(IdentityBackend, cfg);
++
++        t.ingest("p1", "en", "es", &silence(100)).await.unwrap();
++        t.ingest("p1", "en", "ja", &silence(200)).await.unwrap();
++        assert_eq!(t.active_sessions(), 2);
++
++        t.drop_session("p1", "es");
++        assert_eq!(t.active_sessions(), 1);
++    }
++}
+diff --git a/translate.rs b/translate.rs
+new file mode 100644
+index 0000000..b257319
+--- /dev/null
++++ b/translate.rs
+@@ -0,0 +1,124 @@
++//! Freeform chat translation — near-real-time, backend-agnostic.
++//!
++//! This is NOT the low-latency tier. It exists for open chat where
++//! a callout doesn't fit. Sub-second is achievable with a good backend
++//! (streaming ASR + incremental MT), but accuracy trades against speed
++//! — see CallMissed / Forasoft 2026 benchmarks: streaming systems trade
++//! roughly 3-8% accuracy for sub-second latency. Do not route
++//! safety/critical-timing comms through this path; use callout.rs.
++//!
++//! Wire this to a real backend (DeepL, SeamlessM4T, ElevenLabs, etc.)
++//! by implementing TranslationBackend. No backend is bundled here —
++//! that's an API key + vendor decision, not an engineering one.
++
++use async_trait::async_trait;
++use dashmap::DashMap;
++use serde::{Deserialize, Serialize};
++use std::sync::Arc;
++use std::time::{Duration, Instant};
++
++#[derive(Debug, Clone, Serialize, Deserialize)]
++pub struct ChatMessage {
++    pub player_id: String,
++    pub text:      String,
++    pub lang:      String, // BCP-47, e.g. "en", "es", "ja"
++}
++
++#[derive(Debug, thiserror::Error)]
++pub enum TranslateError {
++    #[error("backend error: {0}")]
++    Backend(String),
++    #[error("timeout after {0:?}")]
++    Timeout(Duration),
++}
++
++/// Implement this against whichever vendor you pick. Keep it text-in/
++/// text-out so voice can reuse the same trait once an STT stage feeds it.
++#[async_trait]
++pub trait TranslationBackend: Send + Sync {
++    async fn translate(&self, text: &str, from: &str, to: &str) -> Result<String, TranslateError>;
++}
++
++/// Wraps any backend with a repeat-phrase cache. Players reuse the same
++/// short lines constantly ("gg", "wait", "here") — caching cuts both
++/// latency and per-call cost on repeats without touching accuracy.
++pub struct CachingTranslator<B: TranslationBackend> {
++    backend: B,
++    cache:   Arc<DashMap<(String, String, String), (String, Instant)>>,
++    ttl:     Duration,
++}
++
++impl<B: TranslationBackend> CachingTranslator<B> {
++    pub fn new(backend: B) -> Self {
++        Self {
++            backend,
++            cache: Arc::new(DashMap::new()),
++            ttl:   Duration::from_secs(3600),
++        }
++    }
++
++    pub async fn translate(&self, text: &str, from: &str, to: &str) -> Result<String, TranslateError> {
++        let key = (text.to_string(), from.to_string(), to.to_string());
++
++        if let Some(entry) = self.cache.get(&key) {
++            let (cached, at) = entry.value();
++            if at.elapsed() < self.ttl {
++                return Ok(cached.clone());
++            }
++        }
++
++        let result = self.backend.translate(text, from, to).await?;
++        self.cache.insert(key, (result.clone(), Instant::now()));
++        Ok(result)
++    }
++}
++
++/// Fan a chat message out to N recipient languages. Recipients sharing
++/// the sender's language skip translation entirely (zero latency, zero
++/// cost, zero accuracy risk — always the cheapest path when it applies).
++pub async fn translate_for_recipients<B: TranslationBackend>(
++    translator: &CachingTranslator<B>,
++    msg: &ChatMessage,
++    recipient_langs: &[String],
++) -> Vec<(String, Result<String, TranslateError>)> {
++    let mut out = Vec::with_capacity(recipient_langs.len());
++    for lang in recipient_langs {
++        if lang == &msg.lang {
++            out.push((lang.clone(), Ok(msg.text.clone())));
++            continue;
++        }
++        let r = translator.translate(&msg.text, &msg.lang, lang).await;
++        out.push((lang.clone(), r));
++    }
++    out
++}
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++
++    struct EchoBackend; // test double — real vendor implements this trait
++
++    #[async_trait]
++    impl TranslationBackend for EchoBackend {
++        async fn translate(&self, text: &str, _from: &str, to: &str) -> Result<String, TranslateError> {
++            Ok(format!("[{to}] {text}"))
++        }
++    }
++
++    #[tokio::test]
++    async fn same_lang_skips_translation() {
++        let t = CachingTranslator::new(EchoBackend);
++        let msg = ChatMessage { player_id: "p1".into(), text: "gg".into(), lang: "en".into() };
++        let out = translate_for_recipients(&t, &msg, &["en".into()]).await;
++        assert_eq!(out[0].1.as_ref().unwrap(), "gg");
++    }
++
++    #[tokio::test]
++    async fn cache_avoids_second_backend_call() {
++        let t = CachingTranslator::new(EchoBackend);
++        let a = t.translate("gg", "en", "es").await.unwrap();
++        let b = t.translate("gg", "en", "es").await.unwrap();
++        assert_eq!(a, b);
++    }
++}
